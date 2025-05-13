@@ -1,32 +1,31 @@
 from pathlib import Path
-from random import randrange
 import json
-import torch.serialization
-import numpy.core.multiarray
-import importlib
 
+import numpy.core.multiarray
 import torch
+import matplotlib.pyplot as plt
+
+from datasets import load_dataset
+from peft import (
+    LoraConfig,
+    get_peft_model,
+    prepare_model_for_kbit_training,
+)
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
     TrainingArguments,
 )
-from datasets import load_dataset
-from peft import (
-    LoraConfig,
-    prepare_model_for_kbit_training,
-    get_peft_model,
-)
 from trl import SFTTrainer
-import matplotlib.pyplot as plt
 
+# patch for numpy serialization issue in torch
 torch.serialization.add_safe_globals(
     [numpy.core.multiarray._reconstruct]
 )
 
 dataset_path   = "/scratch/network/jh3258/meditron-fine-tune-rare-diseases/data/train_out.csv"
-model_id       = "/scratch/network/jh3258/meditron-fine-tune-rare-diseases/meditron-7b"          
+model_id       = "/scratch/network/jh3258/meditron-fine-tune-rare-diseases/meditron-7b"
 results_dir    = Path("/scratch/network/jh3258/meditron-fine-tune-rare-diseases/results")
 results_dir.mkdir(parents=True, exist_ok=True)
 
@@ -35,6 +34,7 @@ batch_size     = 6
 grad_acc_steps = 2
 seed           = 42
 
+# LoRA configs to compare (rank 4 and rank 8)
 lora_confs = {
     "rank4": LoraConfig(r=4, lora_alpha=16, lora_dropout=0.1, task_type="CAUSAL_LM"),
     "rank8": LoraConfig(r=8, lora_alpha=16, lora_dropout=0.1, task_type="CAUSAL_LM"),
@@ -42,6 +42,7 @@ lora_confs = {
 
 dataset = load_dataset("csv", data_files=dataset_path)["train"].shuffle(seed=seed)
 
+# prompt formatting per label type
 def format_instruction(sample):
     if sample["category"] == "RAREDISEASE":
         prompt = (
@@ -82,6 +83,7 @@ def format_instruction(sample):
 {sample['response']}
 """
 
+# 4-bit quantization setup using NF4
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_use_double_quant=True,
@@ -94,6 +96,7 @@ lora_losses = {}
 for rank_name, peft_cfg in lora_confs.items():
     print(f"\n=== Training with LoRA {rank_name} ===")
 
+    # load model with quantization config
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         quantization_config=bnb_config,
@@ -103,10 +106,12 @@ for rank_name, peft_cfg in lora_confs.items():
     )
     model.config.pretraining_tp = 1
 
+    # load tokenizer, fix padding tokens
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
+    # enable gradient checkpointing + LoRA prep
     model.gradient_checkpointing_enable()
     model = prepare_model_for_kbit_training(model)
     model = get_peft_model(model, peft_cfg)
@@ -127,11 +132,12 @@ for rank_name, peft_cfg in lora_confs.items():
         max_grad_norm=0.3,
         warmup_ratio=0.03,
         lr_scheduler_type="constant",
-        disable_tqdm=True,      
-        report_to="none",       
+        disable_tqdm=True,
+        report_to="tensorboard",
         seed=seed,
     )
 
+    # wrap model + trainer
     trainer = SFTTrainer(
         model=model,
         train_dataset=dataset,
@@ -142,24 +148,25 @@ for rank_name, peft_cfg in lora_confs.items():
         formatting_func=format_instruction,
         args=args,
     )
-    
+
+    # support resume from checkpoint if needed
     ckpt = output_dir / "checkpoint-240"
     if ckpt.exists():
         print(f"Resuming from {ckpt}")
         trainer.train(resume_from_checkpoint=str(ckpt))
     else:
         trainer.train()
-    
+
+    # save final model + tokenizer
     trainer.save_model()
-    
     adapter_dir   = results_dir / f"{rank_name}/adapter"
     tokenizer_dir = results_dir / f"{rank_name}/tokenizer"
     adapter_dir.mkdir(parents=True, exist_ok=True)
     tokenizer_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(adapter_dir)
+    tokenizer.save_pretrained(tokenizer_dir)
 
-    model.save_pretrained(adapter_dir)        
-    tokenizer.save_pretrained(tokenizer_dir)  
-
+    # extract loss history
     epochs, losses = [], []
     for entry in trainer.state.log_history:
         if "loss" in entry and "epoch" in entry:
@@ -171,16 +178,7 @@ for rank_name, peft_cfg in lora_confs.items():
     with open(results_dir / f"loss_history_{rank_name}.json", "w") as f:
         json.dump(lora_losses[rank_name], f, indent=2)
 
-files = {
-    "LoRA rank 4": results_dir / "loss_history_rank4.json",
-    "LoRA rank 8": results_dir / "loss_history_rank8.json",
-}
-
-lora_losses = {}
-for label, fp in files.items():
-    with open(fp) as f:
-        lora_losses[label] = json.load(f)
-
+# plot loss curves
 plt.figure(figsize=(10, 6))
 for label, data in lora_losses.items():
     plt.plot(data["epochs"], data["losses"], marker="o", label=label)
